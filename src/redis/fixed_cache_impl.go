@@ -1,31 +1,39 @@
 package redis
 
 import (
-	"github.com/envoyproxy/ratelimit/src/stats"
 	"math/rand"
+	"sync"
+
+	"github.com/envoyproxy/ratelimit/src/stats"
 
 	"github.com/coocood/freecache"
-	pb "github.com/envoyproxy/go-control-plane/envoy/service/ratelimit/v3"
 	"github.com/envoyproxy/ratelimit/src/config"
 	"github.com/envoyproxy/ratelimit/src/limiter"
 	"github.com/envoyproxy/ratelimit/src/utils"
-	logger "github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
+
+	pb "github.com/envoyproxy/go-control-plane/envoy/service/ratelimit/v3"
+	storage_strategy "github.com/envoyproxy/ratelimit/src/storage/strategy"
+	logger "github.com/sirupsen/logrus"
 )
 
+type RedisError string
+
+func (e RedisError) Error() string {
+	return string(e)
+}
+
 type fixedRateLimitCacheImpl struct {
-	client Client
+	client storage_strategy.StorageStrategy
 	// Optional Client for a dedicated cache of per second limits.
 	// If this client is nil, then the Cache will use the client for all
 	// limits regardless of unit. If this client is not nil, then it
 	// is used for limits that have a SECOND unit.
-	perSecondClient Client
-	baseRateLimiter *limiter.BaseRateLimiter
-}
-
-func pipelineAppend(client Client, pipeline *Pipeline, key string, hitsAddend uint32, result *uint32, expirationSeconds int64) {
-	*pipeline = client.PipeAppend(*pipeline, result, "INCRBY", key, hitsAddend)
-	*pipeline = client.PipeAppend(*pipeline, nil, "EXPIRE", key, expirationSeconds)
+	perSecondClient            storage_strategy.StorageStrategy
+	jitterRand                 *rand.Rand
+	expirationJitterMaxSeconds int64
+	baseRateLimiter            *limiter.BaseRateLimiter
+	waitGroup                  sync.WaitGroup
 }
 
 func (this *fixedRateLimitCacheImpl) DoLimit(
@@ -42,8 +50,7 @@ func (this *fixedRateLimitCacheImpl) DoLimit(
 	cacheKeys := this.baseRateLimiter.GenerateCacheKeys(request, limits, hitsAddend)
 
 	isOverLimitWithLocalCache := make([]bool, len(request.Descriptors))
-	results := make([]uint32, len(request.Descriptors))
-	var pipeline, perSecondPipeline Pipeline
+	results := make([]uint64, len(request.Descriptors))
 
 	// Now, actually setup the pipeline, skipping empty cache keys.
 	for i, cacheKey := range cacheKeys {
@@ -60,30 +67,22 @@ func (this *fixedRateLimitCacheImpl) DoLimit(
 
 		logger.Debugf("looking up cache key: %s", cacheKey.Key)
 
-		expirationSeconds := utils.UnitToDivider(limits[i].Limit.Unit)
-		if this.baseRateLimiter.ExpirationJitterMaxSeconds > 0 {
-			expirationSeconds += this.baseRateLimiter.JitterRand.Int63n(this.baseRateLimiter.ExpirationJitterMaxSeconds)
-		}
-
 		// Use the perSecondConn if it is not nil and the cacheKey represents a per second Limit.
 		if this.perSecondClient != nil && cacheKey.PerSecond {
-			if perSecondPipeline == nil {
-				perSecondPipeline = Pipeline{}
+			value, err := this.perSecondClient.GetValue(cacheKey.Key)
+			if err != nil {
+				logger.Error(err)
 			}
-			pipelineAppend(this.perSecondClient, &perSecondPipeline, cacheKey.Key, hitsAddend, &results[i], expirationSeconds)
-		} else {
-			if pipeline == nil {
-				pipeline = Pipeline{}
-			}
-			pipelineAppend(this.client, &pipeline, cacheKey.Key, hitsAddend, &results[i], expirationSeconds)
-		}
-	}
 
-	if pipeline != nil {
-		checkError(this.client.PipeDo(pipeline))
-	}
-	if perSecondPipeline != nil {
-		checkError(this.perSecondClient.PipeDo(perSecondPipeline))
+			results[i] = value
+		} else {
+			value, err := this.client.GetValue(cacheKey.Key)
+			if err != nil {
+				logger.Error(err)
+			}
+
+			results[i] = value
+		}
 	}
 
 	// Now fetch the pipeline.
@@ -91,14 +90,44 @@ func (this *fixedRateLimitCacheImpl) DoLimit(
 		len(request.Descriptors))
 	for i, cacheKey := range cacheKeys {
 
-		limitAfterIncrease := results[i]
-		limitBeforeIncrease := limitAfterIncrease - hitsAddend
+		limitBeforeIncrease := uint32(results[i])
+		limitAfterIncrease := limitBeforeIncrease + hitsAddend
 
 		limitInfo := limiter.NewRateLimitInfo(limits[i], limitBeforeIncrease, limitAfterIncrease, 0, 0)
 
 		responseDescriptorStatuses[i] = this.baseRateLimiter.GetResponseDescriptorStatus(cacheKey.Key,
 			limitInfo, isOverLimitWithLocalCache[i], hitsAddend)
 
+		if cacheKey.Key == "" || isOverLimitWithLocalCache[i] {
+			continue
+		}
+
+		expirationSeconds := utils.UnitToDivider(limits[i].Limit.Unit)
+		if this.expirationJitterMaxSeconds > 0 {
+			expirationSeconds += this.jitterRand.Int63n(this.expirationJitterMaxSeconds)
+		}
+
+		if this.perSecondClient != nil && cacheKey.PerSecond {
+			err := this.perSecondClient.IncrementValue(cacheKey.Key, uint64(hitsAddend))
+			if err != nil {
+				logger.Error(err)
+			}
+
+			err = this.perSecondClient.SetExpire(cacheKey.Key, uint64(expirationSeconds))
+			if err != nil {
+				logger.Error(err)
+			}
+		} else {
+			err := this.client.IncrementValue(cacheKey.Key, uint64(hitsAddend))
+			if err != nil {
+				logger.Error(err)
+			}
+
+			err = this.client.SetExpire(cacheKey.Key, uint64(expirationSeconds))
+			if err != nil {
+				logger.Error(err)
+			}
+		}
 	}
 
 	return responseDescriptorStatuses
@@ -107,11 +136,12 @@ func (this *fixedRateLimitCacheImpl) DoLimit(
 // Flush() is a no-op with redis since quota reads and updates happen synchronously.
 func (this *fixedRateLimitCacheImpl) Flush() {}
 
-func NewFixedRateLimitCacheImpl(client Client, perSecondClient Client, timeSource utils.TimeSource,
-	jitterRand *rand.Rand, expirationJitterMaxSeconds int64, localCache *freecache.Cache, nearLimitRatio float32, cacheKeyPrefix string, statsManager stats.Manager) limiter.RateLimitCache {
+func NewFixedRateLimitCacheImpl(client storage_strategy.StorageStrategy, perSecondClient storage_strategy.StorageStrategy, timeSource utils.TimeSource, jitterRand *rand.Rand, localCache *freecache.Cache, expirationJitterMaxSeconds int64, nearLimitRatio float32, cacheKeyPrefix string, statsManager stats.Manager) limiter.RateLimitCache {
 	return &fixedRateLimitCacheImpl{
-		client:          client,
-		perSecondClient: perSecondClient,
-		baseRateLimiter: limiter.NewBaseRateLimit(timeSource, jitterRand, expirationJitterMaxSeconds, localCache, nearLimitRatio, cacheKeyPrefix, statsManager),
+		client:                     client,
+		perSecondClient:            perSecondClient,
+		jitterRand:                 jitterRand,
+		expirationJitterMaxSeconds: expirationJitterMaxSeconds,
+		baseRateLimiter:            limiter.NewBaseRateLimit(timeSource, jitterRand, expirationJitterMaxSeconds, localCache, nearLimitRatio, cacheKeyPrefix, statsManager),
 	}
 }

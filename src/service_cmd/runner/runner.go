@@ -1,8 +1,6 @@
 package runner
 
 import (
-	"github.com/envoyproxy/ratelimit/src/metrics"
-	"github.com/envoyproxy/ratelimit/src/stats"
 	"io"
 	"math/rand"
 	"net/http"
@@ -10,21 +8,21 @@ import (
 	"sync"
 	"time"
 
-	gostats "github.com/lyft/gostats"
-
 	"github.com/coocood/freecache"
-
-	pb_legacy "github.com/envoyproxy/go-control-plane/envoy/service/ratelimit/v2"
-	pb "github.com/envoyproxy/go-control-plane/envoy/service/ratelimit/v3"
-
 	"github.com/envoyproxy/ratelimit/src/config"
 	"github.com/envoyproxy/ratelimit/src/limiter"
 	"github.com/envoyproxy/ratelimit/src/memcached"
+	"github.com/envoyproxy/ratelimit/src/metrics"
 	"github.com/envoyproxy/ratelimit/src/redis"
 	"github.com/envoyproxy/ratelimit/src/server"
-	ratelimit "github.com/envoyproxy/ratelimit/src/service"
 	"github.com/envoyproxy/ratelimit/src/settings"
+	"github.com/envoyproxy/ratelimit/src/stats"
 	"github.com/envoyproxy/ratelimit/src/utils"
+
+	pb_legacy "github.com/envoyproxy/go-control-plane/envoy/service/ratelimit/v2"
+	pb "github.com/envoyproxy/go-control-plane/envoy/service/ratelimit/v3"
+	ratelimit "github.com/envoyproxy/ratelimit/src/service"
+	gostats "github.com/lyft/gostats"
 	logger "github.com/sirupsen/logrus"
 )
 
@@ -55,15 +53,14 @@ func createLimiter(srv server.Server, s settings.Settings, localCache *freecache
 			srv,
 			utils.NewTimeSourceImpl(),
 			rand.New(utils.NewLockedSource(time.Now().Unix())),
-			s.ExpirationJitterMaxSeconds,
 			statsManager)
 	case "memcache":
-		return memcached.NewRateLimitCacheImplFromSettings(
+		return memcached.NewRateLimiterCacheImplFromSettings(
 			s,
+			localCache,
+			srv,
 			utils.NewTimeSourceImpl(),
 			rand.New(utils.NewLockedSource(time.Now().Unix())),
-			localCache,
-			srv.Scope(),
 			statsManager)
 	default:
 		logger.Fatalf("Invalid setting for BackendType: %s", s.BackendType)
